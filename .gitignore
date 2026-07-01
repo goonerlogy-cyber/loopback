@@ -1,0 +1,10 @@
+# os / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+
+# nothing to build — this is a plain static site.
+# no node_modules, no dist, no .env needed.

@@ -1,0 +1,152 @@
+name: validate membership
+
+# Enforces invite-only joining. A pull request that adds a member to webring.json
+# cannot pass this check unless BOTH are true:
+#   1. the diff is a clean single self-addition (no editing/removing other members)
+#   2. the person named in "invitedBy" APPROVES the PR with their real GitHub account
+#      (a maintainer approval also counts, e.g. for founders)
+#
+# Because GitHub authenticates who submits a review, "invitedBy" can't be faked:
+# claiming invitedBy:"dhh" is worthless unless dhh's actual account clicks Approve.
+#
+# Pair this with branch protection (see README) so the check is REQUIRED to merge.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  pull_request_review:
+    types: [submitted, dismissed, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          # comma-separated GitHub usernames allowed to vouch for anyone and to add
+          # "founder" entries. EDIT THIS to your admins.
+          MAINTAINERS: "arshnah"
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = pr.number;
+            const headSha = pr.head.sha;
+            const maintainers = (process.env.MAINTAINERS || "")
+              .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+            const fail = [];   // hard structural problems
+            const notes = [];  // human-readable status lines
+
+            // ---- load webring.json from base and head ----
+            async function getJson(o, r, ref) {
+              try {
+                const res = await github.rest.repos.getContent({ owner: o, repo: r, path: "webring.json", ref });
+                return JSON.parse(Buffer.from(res.data.content, res.data.encoding).toString("utf8"));
+              } catch (e) { return null; }
+            }
+            const base = await getJson(owner, repo, pr.base.sha);
+            const head = await getJson(pr.head.repo.owner.login, pr.head.repo.name, headSha);
+
+            // ---- only webring.json may change ----
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number });
+            const otherFiles = files.map(f => f.filename).filter(f => f !== "webring.json");
+            if (otherFiles.length) fail.push(`This PR changes files other than webring.json: \`${otherFiles.join(", ")}\`. A join PR must only touch webring.json.`);
+
+            if (!Array.isArray(base)) fail.push("Could not read webring.json on the base branch.");
+            if (!Array.isArray(head)) fail.push("webring.json in this PR is missing or not valid JSON.");
+
+            let newEntry = null, inviterGh = null;
+            if (Array.isArray(base) && Array.isArray(head)) {
+              const byName = arr => Object.fromEntries(arr.map(m => [String(m.name || "").toLowerCase(), m]));
+              const B = byName(base), H = byName(head);
+              const added = head.filter(m => !(String(m.name || "").toLowerCase() in B));
+              const removed = base.filter(m => !(String(m.name || "").toLowerCase() in H));
+              const modified = base.filter(m => {
+                const h = H[String(m.name || "").toLowerCase()];
+                return h && JSON.stringify(h) !== JSON.stringify(m);
+              });
+
+              if (removed.length) fail.push(`This PR removes existing members (${removed.map(m => m.name).join(", ")}). You can only add yourself.`);
+              if (modified.length) fail.push(`This PR edits existing members (${modified.map(m => m.name).join(", ")}). You can only add yourself.`);
+              if (added.length === 0) fail.push("This PR doesn't add a new member.");
+              if (added.length > 1) fail.push(`This PR adds ${added.length} members. Add one per PR.`);
+
+              if (added.length === 1) {
+                newEntry = added[0];
+                const nm = String(newEntry.name || "");
+                if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(nm)) fail.push(`\`name\` "${nm}" must be lowercase letters, numbers, and dashes.`);
+                if (!/^https:\/\//.test(String(newEntry.url || ""))) fail.push("`url` must start with https://");
+                if (newEntry.gh && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(String(newEntry.gh))) fail.push("`gh` is not a valid GitHub username.");
+
+                const invitedBy = String(newEntry.invitedBy || "").toLowerCase();
+                if (!invitedBy) {
+                  fail.push("`invitedBy` is required. Set it to the handle of the member who invited you.");
+                } else if (invitedBy === "founder") {
+                  // founder entries are reserved for maintainers
+                  notes.push("This is a `founder` entry — it must be approved by a maintainer.");
+                } else {
+                  const inviter = base.find(m => String(m.name || "").toLowerCase() === invitedBy);
+                  if (!inviter) fail.push(`\`invitedBy\` "${newEntry.invitedBy}" is not a current member of the ring.`);
+                  else if (!inviter.gh) fail.push(`Member "${inviter.name}" has no \`gh\` on file, so their approval can't be verified. A maintainer must approve instead.`);
+                  else inviterGh = String(inviter.gh).toLowerCase();
+                }
+              }
+            }
+
+            // ---- who has approved? (latest review state per user) ----
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number });
+            const lastState = {};
+            for (const r of reviews) if (r.user) lastState[r.user.login.toLowerCase()] = r.state;
+            const approvers = Object.entries(lastState).filter(([, s]) => s === "APPROVED").map(([u]) => u);
+
+            const maintainerApproved = approvers.some(a => maintainers.includes(a));
+            const inviterApproved = inviterGh ? approvers.includes(inviterGh) : false;
+            const vouchOk = maintainerApproved || inviterApproved;
+
+            // ---- verdict ----
+            const structuralOk = fail.length === 0;
+            const ok = structuralOk && vouchOk;
+
+            let description;
+            if (!structuralOk) description = "PR needs changes before it can be vouched for.";
+            else if (vouchOk) description = "Invite verified ✓";
+            else if (inviterGh) description = `Waiting for @${inviterGh} to Approve this PR.`;
+            else description = "Waiting for a maintainer to Approve this PR.";
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: headSha,
+              state: ok ? "success" : "failure",
+              context: "invite/vouch",
+              description: description.slice(0, 140),
+            });
+
+            // ---- sticky comment ----
+            const marker = "<!-- invite-bot -->";
+            const lines = [marker, "### 🔒 Invite verification", ""];
+            if (fail.length) {
+              lines.push("**This PR can't be accepted yet:**", ...fail.map(f => `- ❌ ${f}`), "");
+            } else {
+              lines.push("- ✅ Diff looks clean (single self-addition).");
+              if (newEntry) lines.push(`- Applying to join as **${newEntry.name}**, invited by **${newEntry.invitedBy}**.`);
+            }
+            for (const n of notes) lines.push(`- ℹ️ ${n}`);
+            if (structuralOk) {
+              if (vouchOk) lines.push(`- ✅ Vouch confirmed by ${inviterApproved ? `@${inviterGh}` : "a maintainer"}. A maintainer can merge this.`);
+              else if (inviterGh) lines.push(`- ⏳ **@${inviterGh}, if you invited this person, click _Review → Approve_ to confirm.** Until then this stays blocked.`);
+              else lines.push("- ⏳ A maintainer needs to Approve to confirm.");
+            }
+            const body = lines.join("\n");
+
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pull_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body });
+
+            if (!ok) core.setFailed(description);
